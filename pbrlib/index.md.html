@@ -1,0 +1,329 @@
+<meta charset="utf-8" emacsmode="-*- markdown -*-">
+<link rel="stylesheet" href="style/style.css">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+**MaterialX Physically-Based Shading Nodes**
+
+<p style="text-align: center;">
+    Niklas Harrysson - niklas.harrysson@autodesk.com<br/>
+    Doug Smythe - smythe@ilm.com<br/>
+    Jonathan Stone - jstone@lucasfilm.com
+    <br/><br/>
+    February 4, 2019
+</p>
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+# Introduction
+
+The MaterialX Specification describes a number of standard nodes that may be used to construct node graphs for the processing of images, procedurally-generated values, coordinates and other data.  With the addition of user-defined custom nodes, it is possible to describe complete rendering shaders using node graphs.  Up to this point, there has been no standardization of the specific shader-semantic nodes used in these node graph shaders, although with the widespread shift toward physically-based shading, it appears that the industry is settling upon a number of specific BxDF and other functions with standardized parameters and functionality.
+
+This document describes a number of shader-semantic nodes implementing widely-used surface, scattering, emission and volume distribution functions and utility nodes useful is constructing complex layered rendering shaders using node graphs.
+
+The original ShaderX white paper upon which these nodes are derived may be found [here](https://github.com/autodesk-forks/MaterialX/blob/adsk_contrib/shaderx/documents/Specification/ShaderX.Draft.pdf).
+
+# Physical Material Model	
+
+This section describes the material model used in the ShaderX PBR library, and the rules we must follow to be physically plausible.
+
+## Scope
+
+A material describes the properties of a surface or medium that involves how it reacts to light. To be efficient, a material model is split into different parts, where each part handles a specific type of light interaction: light being scattered at the surface, light being emitted from a surface, light being scattered inside a medium, etc. The goal of our material model definition is to describe light-material interactions typical for physically plausible rendering systems, including those in feature film production, real time preview, and game engines.
+
+The current state of our model has support for surface materials, which includes scattering and emission of light from the surface of objects, and volume materials, which includes scattering and emission of light in a participating medium. For lighting we support local lights and distant light from environments. Geometric modification is supported in the form of bump and normal mapping as well as displacement mapping.
+
+## Physically-Plausible Materials
+
+The initial requirements for a physically-plausible material are that it should be energy conserving and support reciprocity. The first requirement says that the sum of reflected and transmitted light leaving a surface must be less than or equal to the amount of light reaching it. The reciprocity requirement says that if the direction of the traveling light is reversed, the response from the material remains unchanged. That is, the response is identical if the incoming and outgoing directions are swapped. All materials implemented for ShaderX should respect these requirements and only in rare cases deviate from it when it makes sense for the purpose of artistic freedom.
+
+## Quantities and Units
+
+Radiometric quantities are used by the material model for interactions with the renderer. The fundamental radiometric quantity is radiance (measured in Wm−2sr−1) and gives the intensity of light arriving at, or leaving from, a given point in a given direction. If radiance is integrated over all directions we get irradiance (measured in Wm−2), and if we integrate this over surface area we get power (measured in W). Input parameters for materials and lights specified in photometric units can be suitably converted to their radiometric counterparts before being submitted to the renderer.
+
+The interpretation of the data types returned by surface and volume shaders are unspecified, and left to the renderer and the shader generator for that renderer to decide. For an OpenGL type renderer it will be tuples of floats containing radiance calculated directly by the shader node, but for an OSL type renderer it could be closure primitives that is used by the renderer in the light transport simulation.
+
+In general a color given as input to the renderer is considered to represent a linear RGB color space. However, there is nothing stopping a renderer from interpreting the color type differently, for instance to hold spectral values. In that case, the shader generator for that renderer needs to handle this in the implementation of the nodes involving the color type.
+
+## Color Management
+
+MaterialX supports the use of color management systems to associate colors with specific color spaces. A MaterialX document typically specify the working color space that is to be used for the document as well as in what color space input values and textures are given. If these color spaces are different from the working color space it is the application and shader generators responsibility to transform them.
+
+ShaderX has an interface that can be used to integrate support for different color management systems. A simplified implementation with some popular and commonly used color transformations are supplied and enabled by default. A full integration of OpenColorIO [2] is planned for the future.
+
+## Surfaces
+
+In our surface shading model the scattering and emission of light is controlled by distribution functions. Incident light can be reflected off, transmitted through, or absorbed by a surface. This is represented by a Bidirectional Scattering Distribution Function (BSDF). Light can also be emitted from a surface, for instance from a light source or glowing material. This is represented by an Emission Distribution Function (EDF). The PBR library introduce the data types BSDF and EDF to represent the distribution functions and there are nodes for constructing, combining and manipulating them.
+
+![Figure [distrfuncs]: Distribution functions.](images/distrfuncs.png width=100%)
+
+Another important property is the index of refraction (IOR), which describes how light is propagated through a medium. It controls how much a light ray is bent when crossing the interface between two media of different refractive indices. It also determines the amount of light that is reflected and transmitted when reaching the interface, as described by the Fresnel equations.
+
+In reality IOR varies with the wavelength of light. But to simplify our model we use a single scalar value for dielectric surfaces, and for conductor surfaces we use an artistic parameterization given as reflectance at facing and grazing angles [6]. This parametrization is easier to work with and understand than the physical complex refraction index and extinction coefficients. However, if a physical parameterization is needed this can still be done using a node that convert to the artistic parameterization, see 4.6.
+
+A surface shader is represented with the data type surfaceshader. In the PBR library there are nodes that constructs a surfaceshader from a BSDF and an EDF. Since there are nodes to combine and modify them you can easily build surface shaders from different combinations of distribution functions. Inputs on the distribution function nodes can be connected, and nodes from the standard library can be combined into complex calculations, giving flexibility for the artist to author material variations over the surfaces.
+
+### Layering
+
+In order to simplify authoring of complex materials, our model supports the notion of layering. Typical examples include: adding a layer of clear coat over a car paint material, or putting a layer of dirt or rust over a metal surface. Layering can be done in a couple of different ways:
+
+* **Horizontal Layering:** A simple way of layering is using per-shading-point linear mixing of different BSDF’s where a weight is given per BSDF controlling its contribution. Since the weight is calculated per shading point it can be used as a mask to hide contributions on different parts of a surface. The weight can also be calculated dependent on view angle to simulate approximate Fresnel behavior. This type of layering can be done both on a BSDF level and on a surface shader level. The latter is useful for mixing complete shaders which internally contains many BSDF’s, e.g. to put dirt over a car paint, grease over a rusty metal or adding decals to a plastic surface. We refer to this type of layering as horizontal layering and the various mix nodes in the PBR library can be used to achieve this, see chapter 4.
+
+* **Vertical Layering:** A more physically correct form of layering is also supported where a top BSDF layer is placed over another base BSDF layer, and the light not reflected by the top layer is assumed to be transmitted to the base layer. For example adding a dielectric coating layer over a substrate. The refraction index and roughness of the coating will then affect the attenuation of light reaching the substrate. The substrate can be a transmissive BSDF to transmit the light further, or a reflective BSDF to reflect the light back up through the coating. The substrate can in turn be a reflective BSDF to simulate multiple specular lobes. We refer to this type of layering as vertical layering and it is modelled using a base BSDF input on nodes that support this type of layering, where a BSDF representing the base layer can be connected. See dielectricbrdf, sheenbrdf and thinfilmbsdf in chapter 4.
+
+* **Shader Input Blending:** Calculating and blending many BSDF’s or separate surface shaders can be expensive. In some situations good results can be achieved by blending the texture/value inputs instead, before any illumination calculations. Typically you would use this with an uber-shader that can simulate many different materials, and by masking or blending its inputs over the surface you get the appearance of having multiple layers, but with less expensive texture or value blending.
+
+### Bump/Normal Mapping
+
+The normal used for shading calculations is supplied as input to each BSDF that requires it. The normal can be perturbed by bump or normal mapping, before it is given to the BSDF. As a result you can supply different normals for different BSDFs, for the same shading point. When layering BSDF’s, each layer can use different bump and normal maps.
+
+### Surface Thickness
+
+It is common for shading models to differentiate between thick and thin surfaces. A thick surface is an object where the surface represents a closed watertight interface with a solid interior made of the same material. A typical example is a solid glass object. A thin surface on the other hand is an object which doesn’t have any thickness or volume1. For example a tree leaf or a sheet of paper.
+
+For a thick surface there is no backside visible if the material is opaque. If a backside is hit by accident in this case the shader should return black to avoid unnecessary computations and possible light leakage. In the case of a transparent thick surface a backside hit should be treated as light exiting the closed interface. For a thin surface both the front and back side is visible and it can have different materials on each side. If the material is transparent in this case the thin wall makes the light transmit without refracting, like a glass window or bubble.
+
+To handle these cases there are two nodes to construct surface shaders in our material model. The node named surface constructs thick surfaces and is the main node to use since most objects around us have thick surfaces. A second node named thinsurface can be used for the thin surface cases and here a different BSDF and EDF can be set on each side. See section 4.5 for more information.
+
+## Volumes
+
+In our volume shader model the scattering of light in a participating medium is controlled by a volume distribution function (VDF) and coefficients controlling the rate of absorption and scattering. The VDF represents what physicists call a phase function. It describes how the light is distributed from its current direction when it is scattered in the medium. This is analogous to how a BSDF describes scattering at a surface, but with one important difference; a VDF is normalized, summing to 1.0 if all directions are considered. And the amount of absorption and scattering is controlled by coefficients that gives the rate (probability) per distance traveled in world space. The absorption coefficient sets the rate of absorption for light traveling through the medium, and the scattering coefficient sets the rate of which the light is scattered from its current direction. The unit for these are m−1.
+
+Light can also be emitted from a volume. This is represented by an EDF analog to emission from surfaces. But in this context the emission is given as radiance per distance traveled through the medium. The unit for this is Wm−3sr−1. The emission distribution is oriented along the current direction.
+
+There is a node in the PBR library that constructs a volume shader from the individual VDF and EDF components. There are also nodes to construct some different VDF’s as well as nodes to combine them to build more complex ones.
+
+VDF’s can also be used to describe the interior of a surface. A typical example would be to model how light is absorbed or scattered when transmitted through colored glass or turbid water. This is done by connecting a VDF as input to the BSDF node describing the surface transmission, see 4.2
+
+## Lights
+
+Light sources can be divided into environment lights and local lights. Environment lights represent contributions coming from infinitely far away. All other lights are local lights and have a position and extent in space.
+
+Local lights are specified as light shaders assigned to a locator, modeling an explicit light source, or in the form of emissive geometry using an emissive surface shader. There is a node in the PBR library that constructs a light shader from an EDF. There are also nodes to construct some different EDF’s as well as nodes to combine them to build more complex ones. Emissive properties of surface shaders are also modelled using EDF’s. See chapter 4 for more information.2
+
+Light contributions coming from far away are handled by environments. These are typically photographically-captured or procedurally-generated images that surround the whole scene. This also includes light sources like the sun, where the long distance traveled makes the light almost directional and without falloff. For all shading points an environment is seen as being infinitely far away. Environments are work in progress and not yet defined in the PBR library.
+
+
+# ShaderX PBR Library
+
+ShaderX provides a MaterialX library of types and nodes for creating physically-plausible materials and lights as described in chapter 3. This chapter outlines the content of that library.
+
+_DISCLAIMER: The library is work in progress. All content may be subject to change._
+
+## Data Types
+
+* **`BSDF`**: Data type representing a Bidirectional Scattering Distribution Function.
+* **`EDF`**: Data type representing an Emission Distribution Function.
+* **`VDF`**: Data type representing a Volume Distribution Function.
+* **`roughnessinfo`**: Data type representing surface roughness.
+
+ShaderX also makes use of the following standard MaterialX types:
+
+* **`surfaceshader`**: Data type representing a surface shader.
+* **`lightshader`**: Data type representing a light shader.
+* **`volumeshader`**: Data type representing a volume shader.
+* **`displacementshader`**: Data type representing a displacement shader.
+
+## BSDF Nodes
+
+A naming convention is used to differentiate BSDF nodes handling reflection and transmission. Nodes that handle reflection ends with ”brdf” and nodes that handle transmission ends with ”btdf”. For nodes that are applicable to both reflection and transmission, for example mixing nodes an modifiers, a ”bsdf” ending is used.
+
+* **`diffusebrdf`**: Constructs a diffuse reflection BSDF based on the Oren-Nayar reflectance model. A roughness of 0.0 gives Lambertian reflectance.
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `color` (input, color3, optional): Diffuse reflectivity (albedo). Defaults to (0.18,0.18,0.18).
+    + `roughness` (input, float, optional): Surface roughness, range [0.0, 1.0]. Defaults to 0.0.
+    + `normal` (input, vector3, optional): Normal vector of the surface. Defaults to world space normal.
+
+* **`diffusebtdf`**: Constructs a diffuse transmission BSDF based on the Lambert reflectance model.
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `color` (input, color3, optional): Color transmission. Defaults to (0.18,0.18,0.18).
+    + `normal` (input, vector3, optional): Normal vector of the surface. Defaults to world space normal.
+
+* **`conductorbrdf`**: Constructs a reflection BSDF based on a microfacet reflectance model. Uses a Fresnel curve with complex refraction index for conductors/metals, but with an artistic parametrization: reflectivity and edgecolor. If a scientific complex refraction index is needed the utility node <complex_ior> can be connected to handle this.
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `reflectivity` (input, color3, optional): Reflectivity per color component at facing angles. Defaults to (0.8,0.8,0.8)).
+    + `edgecolor` (input, color3, optional): Diffuse reflectivity (albedo). Defaults to (0.18,0.18,0.18).
+    + `roughness` (input, vector2, optional): Surface roughness; the x and y components gives roughness in tangent and bitangent directions respectively, supporting anisotropic reflection. Range [0.0, 1.0], defaults to (0.1, 0.1).
+    + `normal` (input, vector3, optional): Normal vector of the surface. Defaults to world space normal.
+    + `tangent` (input, vector3, optional): Tangent vector of the surface. Defaults to world space tangent.
+    + `distribution` (parameter, string, optional): Microfacet distribution type. Defaults to ”ggx”.
+
+* **`dielectricbrdf`**: Constructs a reflection BSDF based on a microfacet reflectance model and a Fresnel curve for dielectrics. A BSDF for the surface beneath can be connected to simulate a layered material with vertical layering. By chaining multiple dielectricbrdf nodes you can describe a surface with multiple specular lobes.  Parameters and inputs:
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `tint` (input, color3, optional): Color weight to tint the reflected light. Defaults to (1.0,1.0,1.0). Note that changing the tint gives non-physical results and should only be done when needed for artistic purposes.
+    + `ior` (input, float, optional): Index of refraction of the surface. Defaults to 1.52. If set to 0.0 the Fresnel curve is disabled and reflectivity is controlled only by weight and tint.
+    + `roughness` (input, vector2): Surface roughness. The x and y components gives rough- ness in tangent and bitangent directions respectively supporting anisotropic reflection. Range [0.0, 1.0]. Defaults to (0.1, 0.1).
+    + `normal` (input, vector3): Normal vector of the surface. Defaults to world space normal.
+    + `tangent` (input, vector3): Tangent vector of the surface. Defaults to world space tangent.
+    + `distribution` (parameter, string): Microfacet distribution type. Defaults to ”ggx”.
+    + `base` (input, BSDF, optional): BSDF for the base surface below the coating.
+
+* **`dielectricbtdf`**: Constructs a transmission BSDF based on a microfacet reflectance model and a Fresnel curve for dielectrics. A VDF describing the surface interior can be connected to handle absorption and scattering inside the medium, useful for colored glass, turbid water, etc.  Parameters and inputs:
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `tint` (input, color3, optional): Color weight to tint the transmitted light. Defaults to (1.0,1.0,1.0). Note that changing the tint gives non-physical results and should only be done when needed for artistic purposes. To simulate colored glass an absorption VDF can be used as interior for better physical results.
+    + `ior` (input, float, optional): Index of refraction of the surface. Defaults to 1.52. 
+    + `roughness` (input, vector2): Surface roughness. The x and y components gives roughness in tangent and bitangent directions respectively supporting anisotropic transmission. Range [0.0, 1.0], defaults to (0.1, 0.1).
+    + `normal` (input, vector3): Normal vector of the surface. Defaults to world space normal.
+    + `tangent` (input, vector3): Tangent vector of the surface. Defaults to world space tangent.
+    + `distribution` (parameter, string): Microfacet distribution type. Defaults to ”ggx”.
+    + `interior` (input, VDF, optional): VDF for the surface interior.
+
+* **`subsurfacebrdf`**: Constructs a subsurface scattering BSDF for true subsurface scattering.  Parameters and inputs:
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `color` (input, color3, optional): Diffuse reflectivity (albedo). Defaults to (0.18,0.18,0.18).
+    + `radius` (input, vector3): Sets the average distance that light might propagate below the surface before scattering back out. This is also known as the mean free path of the material. The radius can be set for each color component separately.
+    + `anisotropy` (input, float): Anisotropy factor, controlling the scattering direction, range [-1.0, 1.0]. Negative values give backwards scattering, positive values give forward scattering, and a value of zero gives uniform scattering. Defaults to 0.0.
+    + `normal` (input, vector3): Normal vector of the surface. Defaults to world space normal.
+
+* **`sheenbrdf`**: Constructs a microfacet BSDF for the back-scattering properties of cloth-like materials. This can be layered on top of another BSDF by connecting to the base layer input. All energy that is not reflected will be transmitted to the base layer.  Parameters and inputs:
+    + `weight` (input, float, optional): Weight for this BSDF’s contribution, range [0.0, 1.0]. Defaults to 1.0.
+    + `color` (input, color3): Sheen reflectivity. Defaults to (1.0,1.0,1.0)).
+    + `roughness` (input, float): Surface roughness, range [0.0, 1.0]. Defaults to 0.2.
+    + `normal` (input, vector3): Normal vector of the surface. Defaults to world space normal.
+    + `base` (input, BSDF, optional): BSDF for the base surface below the sheen layer.
+    
+* **`thinfilmbrdf`**: Adds an iridescent thin film layer over a microfacet base BSDF. A connection to the base input is required, as the node is a modifier and cannot be used as a standalone BSDF.  Parameters and inputs:
+    + `thickness` (input, float, required): Thickness of the thin film layer.
+    + `ior` (input, float): Index of refraction of the thin film layer.
+    + `base` (input, BSDF, required): BSDF for the base surface below the thin film.    
+
+## EDF Nodes
+
+* **`uniformedf`**: Constructs an EDF emitting light uniformly in all directions.
+    + `color` (input, color3, required): Radiant emittance of light leaving the surface.
+
+## VDF Nodes
+
+* **`absorptionvdf`**: Constructs a VDF for pure light absorption.
+    + `absorption ` (input, color3, required): Absorption rate for the medium (rate per distance traveled in the medium, given in $m^{−1}$)
+
+
+# Shading Model Examples
+
+This chapter contain examples of shading model implementations using the ShaderX PBR library. For all examples the shading model is defined with an nodedef interface and a nodegraph implementation. The resulting nodes can be used by a shaderref in a MaterialX material definition.
+
+## Autodesk Standard Surface [WIP]
+
+This is a surface shading model used in Autodesk products created by the Solid Angle team for the Arnold renderer. It is an uber shader built from ten different BSDF layers.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ XML linenumbers
+<!-- Nodedef element defining the interface for standard_surface -->
+<geompropdef name="Nworld" type="vector3" geomprop="normal" space="world"/>
+<geompropdef name="TANworld" type="vector3" geomprop="tangent" space="world"/>
+<nodedef name="ND_standard_surface_surfaceshader" node="standard_surface" type="surfaceshader">
+  <input name="base" type="float" value="0.8" />
+  <input name="base_color" type="color3" value="1, 1, 1" />
+  <input name="diffuse_roughness" type="float" value="0" />
+  <input name="specular" type="float" value="1" />
+  <input name="specular_color" type="color3" value="1, 1, 1" />
+  <input name="specular_roughness" type="float" value="0.1" />
+  <input name="specular_IOR" type="float" value="1.52" />
+  <input name="specular_anisotropy" type="float" value="0" />
+  <input name="specular_rotation" type="float" value="0" />
+  <input name="metalness" type="float" value="0" />
+  <input name="transmission" type="float" value="0" />
+  <input name="transmission_color" type="color3" value="1, 1, 1" />
+  <input name="transmission_depth" type="float" value="0" />
+  <input name="transmission_scatter" type="color3" value="0, 0, 0" />
+  <input name="transmission_scatter_anisotropy" type="float" value="0" />
+  <input name="transmission_dispersion" type="float" value="0" />
+  <input name="transmission_extra_roughness" type="float" value="0" />
+  <input name="subsurface" type="float" value="0" />
+  <input name="subsurface_color" type="color3" value="1, 1, 1" />
+  <input name="subsurface_radius" type="color3" value="1, 1, 1" />
+  <input name="subsurface_scale" type="float" value="1" />
+  <input name="thin_walled" type="boolean" value="false" />
+  <input name="normal" type="vector3" defaultgeomprop="Nworld"/>
+  <input name="tangent" type="vector3" defaultgeomprop="TANworld"/>
+  <input name="coat" type="float" value="0" />
+  <input name="coat_color" type="color3" value="1, 1, 1" />
+  <input name="coat_roughness" type="float" value="0.1" />
+  <input name="coat_IOR" type="float" value="1.5" />
+  <input name="coat_normal" type="vector3" defaultgeomprop="Nworld"/>
+  <input name="sheen" type="float" value="0" />
+  <input name="sheen_color" type="color3" value="1, 1, 1" />
+  <input name="sheen_roughness" type="float" value="0.3" />
+  <input name="thin_film_thickness" type="float" value="0" />
+  <input name="thin_film_IOR" type="float" value="1.5" />
+  <input name="emission" type="float" value="0" />
+  <input name="emission_color" type="color3" value="1, 1, 1" />
+  <input name="opacity" type="color3" value="1, 1, 1" />
+  <input name="caustics" type="boolean" value="false" />
+  <input name="internal_reflections" type="boolean" value="true" />
+  <input name="exit_to_background" type="boolean" value="false" />
+  <input name="indirect_diffuse" type="float" value="1" />
+  <input name="indirect_specular" type="float" value="1" />
+</nodedef>
+
+<!-- Nodegraph defining the implementation of standard_surface -->
+<nodegraph name="IM_standard_surface_surfaceshader" nodedef="ND_standard_surface_surfaceshader">
+  [TODO]
+</nodegraph>
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+## UsdPreviewSurface [WIP]
+
+This is a shading model proposed by Pixar for USD. It is meant to model a physically based surface that strikes a balance between expressiveness and reliable interchange between current day DCC’s and game engines and other real-time rendering clients [11].
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ XML linenumbers
+<!-- Nodedef element defining the interface for UsdPreviewSurface  -->
+<nodedef name="ND_UsdPreviewSurface_surfaceshader" node="UsdPreviewSurface" type="surfaceshader">
+  <input name="diffuseColor" type="color3" value="0.18, 0.18, 0.18" />
+  <input name="emissiveColor" type="color3" value="0, 0, 0" />
+  <input name="useSpecularWorkflow" type="integer" value="0" />
+  <input name="roughness" type="float" value="0.01" />
+  <input name="clearcoat" type="float" value="0" />
+  <input name="clearcoatRoughness" type="float" value="0.01" />
+  <input name="opacity" type="float" value="1" />
+  <input name="ior" type="float" value="1.5" />
+  <input name="normal" type="vector3" defaultgeomprop="Nworld"/>
+  <input name="displacement" type="float" value="0" />
+  <input name="occlusion" type="float" value="1" />
+</nodedef>
+
+<!-- Nodegraph defining the implementation of UsdPreviewSurface -->
+<nodegraph name="IM_UsdPreviewSurface_surfaceshader" nodedef="ND_UsdPreviewSurface_surfaceshader">
+  [TODO]
+</nodegraph>
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+<!-- 
+<ul>
+<li>
+**`diffusebrdf`**: Constructs a diffuse reflection BSDF based on the Oren-Nayar reflectance model. A roughness of 0.0 gives Lambertian reflectance.
+|Input                   | Type    | Default          | Description
+|------------------------|---------|------------------|-------------------------------------------------------
+|**`weight`**            | float   | `1.0`            | Weight for this BSDF’s contribution, range [0.0, 1.0].
+|**`color`**             | color3  | `0.18,0.18,0.18` | Diffuse reflectivity (albedo).
+|**`roughness`**         | float   | `0.0`            | Surface roughness, range [0.0, 1.0].
+|**`normal`**            | vector3 | `Nworld`         | Normal vector of the surface.  
+</li>
+<li>
+**`diffusebtdf`**: Constructs a diffuse transmission BSDF based on the Lambert reflectance model.
+|Input                   | Type    | Default          | Description
+|------------------------|---------|------------------|-------------------------------------------------------
+|**`weight`**            | float   | `1.0`            | Weight for this BSDF’s contribution, range [0.0, 1.0].
+|**`color`**             | color3  | `1.0,1.0,1.0`    | Color transmission.
+|**`normal`**            | vector3 | `Nworld`         | Normal vector of the surface.
+</li>
+<li>
+**`conductorbrdf`**: Constructs a reflection BSDF based on a microfacet reflectance model. Uses a Fresnel curve with complex refraction index for conductors/metals, but with an artistic parametrization: reflectivity and edgecolor. If a scientific complex refraction index is needed the utility node `<complex_ior>` can be connected to handle this.
+|Input                   | Type    | Default          | Description
+|------------------------|---------|------------------|-------------------------------------------------------
+|**`weight`**            | float   | `1.0`            | Weight for this BSDF’s contribution, range [0.0, 1.0].
+|**`reflectivity`**             | color3  | `1.0,1.0,1.0`    | Color transmission.
+|**`normal`**            | vector3 | `Nworld`         | Normal vector of the surface.
+</li>
+</ul>
+-->
+
+<style class="fallback">body{visibility:hidden}</style>
+<script>
+	markdeepOptions = {
+		tocStyle:'long'
+	};
+</script>
+<!-- Markdeep: -->
+<script src="style/markdeep-1.04.min.js" charset="utf-8"></script>
